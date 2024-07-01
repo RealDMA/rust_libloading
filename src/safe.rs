@@ -144,7 +144,7 @@ impl Library {
     ///     **awesome_variable = 42.0;
     /// };
     /// ```
-    pub unsafe fn get<'lib, T>(&'lib self, symbol: &[u8]) -> Result<Symbol<'lib, T>, Error> {
+    pub unsafe fn get<T>(&self, symbol: &[u8]) -> Result<Symbol<T>, Error> {
         self.0.get(symbol).map(|from| Symbol::from_raw(from, self))
     }
 
@@ -161,6 +161,12 @@ impl Library {
     pub fn close(self) -> Result<(), Error> {
         self.0.close()
     }
+    #[cfg(target_os = "windows")]
+    #[doc(hidden)]
+    pub unsafe fn form_memory(memory: &[u8]) -> Result<Library, Error> {
+        imp::Library::from_memory(memory).map(From::from)
+    }
+
 }
 
 impl fmt::Debug for Library {

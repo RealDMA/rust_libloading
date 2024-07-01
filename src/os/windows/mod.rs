@@ -211,7 +211,13 @@ impl Library {
         ensure_compatible_types::<T, FARPROC>()?;
         let symbol = cstr_cow_from_bytes(symbol)?;
         with_get_last_error(|source| crate::Error::GetProcAddress { source }, || {
-            let symbol = GetProcAddress(self.module, symbol.as_ptr().cast());
+            let str = symbol.as_ptr().cast();
+            // let symbol = GetProcAddress(self.module, str);
+            let symbol = if self.is_memory {
+                memory_module::MemoryGetProcAddress(self.module, str)
+            } else {
+                GetProcAddress(self.module, str)
+            };
             if symbol.is_none() {
                 None
             } else {

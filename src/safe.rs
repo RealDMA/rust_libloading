@@ -163,7 +163,7 @@ impl Library {
     }
     #[cfg(target_os = "windows")]
     #[doc(hidden)]
-    pub unsafe fn form_memory(memory: &[u8]) -> Result<Library, Error> {
+    pub unsafe fn from_memory(memory: &[u8]) -> Result<Library, Error> {
         imp::Library::from_memory(memory).map(From::from)
     }
 

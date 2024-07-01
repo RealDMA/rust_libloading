@@ -1,3 +1,4 @@
+
 // A hack for docs.rs to build documentation that has both windows and linux documentation in the
 // same rustdoc build visible.
 #[cfg(all(libloading_docs, not(windows)))]
@@ -15,13 +16,29 @@ mod windows_imports {
     windows_targets::link!("kernel32.dll" "system" fn GetProcAddress(module: HMODULE, procname: *const u8) -> FARPROC);
 }
 
+mod memory_module{
+    use super::{ HMODULE, FARPROC};
+
+    extern "C" {
+        pub(super) fn MemoryLoadLibrary(data: *const u8, size: usize) -> HMODULE;
+        pub(super) fn MemoryFreeLibrary(module: HMODULE);
+        pub(super) fn MemoryGetProcAddress(module: HMODULE, name: *const u8) -> FARPROC;
+    }
+}
+
+
+
 use self::windows_imports::*;
 use util::{ensure_compatible_types, cstr_cow_from_bytes};
 use std::ffi::{OsStr, OsString};
 use std::{fmt, io, marker, mem, ptr};
+use os::windows::memory_module::MemoryFreeLibrary;
 
 /// The platform-specific counterpart of the cross-platform [`Library`](crate::Library).
-pub struct Library(HMODULE);
+pub struct Library{
+    module:HMODULE,
+    is_memory:bool
+}
 
 unsafe impl Send for Library {}
 // Now, this is sort-of-tricky. MSDN documentation does not really make any claims as to safety of
@@ -69,6 +86,15 @@ impl Library {
     pub unsafe fn new<P: AsRef<OsStr>>(filename: P) -> Result<Library, crate::Error> {
         Library::load_with_flags(filename, 0)
     }
+    #[doc(hidden)]
+    pub unsafe fn from_memory(body:&[u8]) -> Result<Library, crate::Error> {
+        let handle = memory_module::MemoryLoadLibrary(body.as_ptr(), body.len());
+        if handle == 0 {
+            Err(crate::Error::LoadLibraryExWUnknown)
+        } else {
+            Ok(Library{module:handle,is_memory:true})
+        }
+    }
 
     /// Get the `Library` representing the original program executable.
     ///
@@ -87,7 +113,7 @@ impl Library {
                 if result == 0 {
                     None
                 } else {
-                    Some(Library(handle))
+                    Some(Library{module:handle,is_memory:false})
                 }
             }).map_err(|e| e.unwrap_or(crate::Error::GetModuleHandleExWUnknown))
         }
@@ -122,7 +148,7 @@ impl Library {
                 if result == 0 {
                     None
                 } else {
-                    Some(Library(handle))
+                    Some(Library{module:handle,is_memory:false})
                 }
             }).map_err(|e| e.unwrap_or(crate::Error::GetModuleHandleExWUnknown))
         };
@@ -162,7 +188,7 @@ impl Library {
             if handle == 0 {
                 None
             } else {
-                Some(Library(handle))
+                Some(Library{module:handle,is_memory:false})
             }
         }).map_err(|e| e.unwrap_or(crate::Error::LoadLibraryExWUnknown));
         drop(wide_filename); // Drop wide_filename here to ensure it doesn’t get moved and dropped
@@ -185,7 +211,7 @@ impl Library {
         ensure_compatible_types::<T, FARPROC>()?;
         let symbol = cstr_cow_from_bytes(symbol)?;
         with_get_last_error(|source| crate::Error::GetProcAddress { source }, || {
-            let symbol = GetProcAddress(self.0, symbol.as_ptr().cast());
+            let symbol = GetProcAddress(self.module, symbol.as_ptr().cast());
             if symbol.is_none() {
                 None
             } else {
@@ -206,7 +232,12 @@ impl Library {
         ensure_compatible_types::<T, FARPROC>()?;
         with_get_last_error(|source| crate::Error::GetProcAddress { source }, || {
             let ordinal = ordinal as usize as *const _;
-            let symbol = GetProcAddress(self.0, ordinal);
+
+            let symbol = if self.is_memory {
+                memory_module::MemoryGetProcAddress(self.module, ordinal)
+            } else {
+                GetProcAddress(self.module, ordinal)
+            };
             if symbol.is_none() {
                 None
             } else {
@@ -220,7 +251,7 @@ impl Library {
 
     /// Convert the `Library` to a raw handle.
     pub fn into_raw(self) -> HMODULE {
-        let handle = self.0;
+        let handle = self.module;
         mem::forget(self);
         handle
     }
@@ -233,7 +264,7 @@ impl Library {
     /// `LoadLibraryExW`, or `LoadLibraryExA`, or a handle previously returned by the
     /// `Library::into_raw` call.
     pub unsafe fn from_raw(handle: HMODULE) -> Library {
-        Library(handle)
+        Library{module:handle,is_memory:false}
     }
 
     /// Unload the library.
@@ -244,7 +275,11 @@ impl Library {
     /// The underlying data structures may still get leaked if an error does occur.
     pub fn close(self) -> Result<(), crate::Error> {
         let result = with_get_last_error(|source| crate::Error::FreeLibrary { source }, || {
-            if unsafe { FreeLibrary(self.0) == 0 } {
+            if self.is_memory {
+                unsafe{memory_module::MemoryFreeLibrary(self.module)};
+                Some(())
+            }
+            else if unsafe { FreeLibrary(self.module) == 0 } {
                 None
             } else {
                 Some(())
@@ -260,7 +295,12 @@ impl Library {
 
 impl Drop for Library {
     fn drop(&mut self) {
-        unsafe { FreeLibrary(self.0); }
+        if !self.is_memory{
+            unsafe { MemoryFreeLibrary(self.module); }
+        }else {
+            unsafe { FreeLibrary(self.module); }
+
+        }
     }
 }
 
@@ -270,16 +310,16 @@ impl fmt::Debug for Library {
             // FIXME: use Maybeuninit::uninit_array when stable
             let mut buf =
                 mem::MaybeUninit::<[mem::MaybeUninit<u16>; 1024]>::uninit().assume_init();
-            let len = GetModuleFileNameW(self.0,
+            let len = GetModuleFileNameW(self.module,
                 buf[..].as_mut_ptr().cast(), 1024) as usize;
             if len == 0 {
-                f.write_str(&format!("Library@{:#x}", self.0))
+                f.write_str(&format!("Library@{:#x}", self.module))
             } else {
                 let string: OsString = OsString::from_wide(
                     // FIXME: use Maybeuninit::slice_get_ref when stable
                     &*(&buf[..len] as *const [_] as *const [u16]),
                 );
-                f.write_str(&format!("Library@{:#x} from {:?}", self.0, string))
+                f.write_str(&format!("Library@{:#x} from {:?}", self.module, string))
             }
         }
     }
